@@ -74,26 +74,6 @@
   { vote: bool, amount: uint }
 )
 
-(define-private (create-single-milestone (project-id uint) (milestone-index uint) (description (string-ascii 300)) (allocation uint) (deadline uint))
-  (begin
-    (map-set project-milestones 
-      { project-id: project-id, milestone-index: milestone-index }
-      {
-        description: description,
-        funding-allocation: allocation,
-        deliverable-hash: none,
-        completion-deadline: (+ stacks-block-height deadline),
-        status: "pending",
-        votes-for: u0,
-        votes-against: u0,
-        voting-ends: none,
-        submitted-at: none
-      }
-    )
-    true
-  )
-)
-
 (define-public (join-dao (stake-amount uint))
   (begin
     (asserts! (> stake-amount u0) ERR_INVALID_AMOUNT)
@@ -134,22 +114,7 @@
   )
 )
 
-(define-public (create-milestone (project-id uint) (milestone-index uint) (description (string-ascii 300)) (allocation uint) (deadline uint))
-  (let
-    (
-      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
-    )
-    (asserts! (is-eq tx-sender (get proposer project)) ERR_NOT_AUTHORIZED)
-    (asserts! (is-eq (get status project) "voting") ERR_PROJECT_NOT_APPROVED)
-    (asserts! (> allocation u0) ERR_INVALID_AMOUNT)
-    (asserts! (> deadline u0) ERR_INVALID_AMOUNT)
-    (create-single-milestone project-id milestone-index description allocation deadline)
-    (map-set projects project-id
-      (merge project { milestone-count: (+ (get milestone-count project) u1), milestone-based: true })
-    )
-    (ok true)
-  )
-)
+
 
 (define-public (vote-on-project (project-id uint) (vote-for bool))
   (let
@@ -225,10 +190,183 @@
     )
     (asserts! (is-eq tx-sender (get proposer project)) ERR_NOT_AUTHORIZED)
     (asserts! (is-eq (get status project) "funded") ERR_PROJECT_NOT_APPROVED)
-    (asserts! (not (get milestone-based project)) ERR_INVALID_MILESTONE)
     (try! (as-contract (stx-transfer? (get funded-amount project) tx-sender (get proposer project))))
     (map-set projects project-id (merge project { status: "completed" }))
     (ok true)
+  )
+)
+
+(define-public (withdraw-stake (amount uint))
+  (let
+    (
+      (current-stake (default-to u0 (map-get? member-stakes tx-sender)))
+    )
+    (asserts! (>= current-stake amount) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (map-set member-stakes tx-sender (- current-stake amount))
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
+    (ok true)
+  )
+)
+
+(define-read-only (get-project (project-id uint))
+  (map-get? projects project-id)
+)
+
+(define-read-only (get-member-stake (member principal))
+  (default-to u0 (map-get? member-stakes member))
+)
+
+(define-read-only (get-member-vote (project-id uint) (voter principal))
+  (map-get? member-votes { project-id: project-id, voter: voter })
+)
+
+(define-read-only (get-project-funding (project-id uint) (funder principal))
+  (default-to u0 (map-get? project-funders { project-id: project-id, funder: funder }))
+)
+
+(define-read-only (get-treasury-balance)
+  (var-get treasury-balance)
+)
+
+(define-read-only (get-next-project-id)
+  (var-get next-project-id)
+)
+
+(define-read-only (get-voting-period)
+  (var-get voting-period)
+)
+
+(define-read-only (get-min-proposal-deposit)
+  (var-get min-proposal-deposit)
+)
+
+(define-read-only (get-project-milestone (project-id uint) (milestone-index uint))
+  (map-get? project-milestones { project-id: project-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-milestone-vote (project-id uint) (milestone-index uint) (voter principal))
+  (map-get? milestone-votes { project-id: project-id, milestone-index: milestone-index, voter: voter })
+)
+
+(define-read-only (get-milestone-voting-period)
+  (var-get milestone-voting-period)
+)
+
+(define-public (update-voting-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set voting-period new-period)
+    (ok true)
+  )
+)
+
+(define-public (update-min-deposit (new-deposit uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set min-proposal-deposit new-deposit)
+    (ok true)
+  )
+)
+
+(define-private (range (start uint) (end uint))
+  (if (<= start end)
+    (unwrap-panic (as-max-len? (append (range start (- end u1)) end) u10))
+    (list)
+  )
+)
+
+(define-private (tuple (a (string-ascii 300)) (b uint) (c uint) (d uint))
+  { description: a, allocation: b, deadline: c, index: d }
+)
+
+(define-private (create-project-milestones (project-id uint) (descriptions (list 10 (string-ascii 300))) (allocations (list 10 uint)) (deadlines (list 10 uint)))
+  (let
+    (
+      (milestone-count (len descriptions))
+    )
+    (fold create-single-milestone 
+      (map tuple descriptions allocations deadlines (range u0 milestone-count))
+      { project-id: project-id, result: (ok true) }
+    )
+    (ok true)
+  )
+)
+
+(define-private (create-single-milestone (milestone-data { description: (string-ascii 300), allocation: uint, deadline: uint, index: uint }) (state { project-id: uint, result: (response bool uint) }))
+  (let
+    (
+      (project-id (get project-id state))
+      (milestone-index (get index milestone-data))
+    )
+    (if (is-ok (get result state))
+      (begin
+        (map-set project-milestones 
+          { project-id: project-id, milestone-index: milestone-index }
+          {
+            description: (get description milestone-data),
+            funding-allocation: (get allocation milestone-data),
+            deliverable-hash: none,
+            completion-deadline: (+ stacks-block-height (get deadline milestone-data)),
+            status: "pending",
+            votes-for: u0,
+            votes-against: u0,
+            voting-ends: none,
+            submitted-at: none
+          }
+        )
+        { project-id: project-id, result: (ok true) }
+      )
+      state
+    )
+  )
+)
+
+(define-private (range (start uint) (end uint))
+  (if (<= start end)
+    (unwrap-panic (as-max-len? (append (range start (- end u1)) end) u10))
+    (list)
+  )
+)
+
+(define-private (tuple (a (string-ascii 300)) (b uint) (c uint) (d uint))
+  { description: a, allocation: b, deadline: c, index: d }
+)
+
+(define-public (propose-milestone-project (title (string-ascii 100)) (description (string-ascii 500)) (funding-goal uint) (milestone-descriptions (list 10 (string-ascii 300))) (milestone-allocations (list 10 uint)) (milestone-deadlines (list 10 uint)))
+  (let
+    (
+      (project-id (var-get next-project-id))
+      (member-stake (default-to u0 (map-get? member-stakes tx-sender)))
+      (milestone-count (len milestone-descriptions))
+      (total-allocation (fold + milestone-allocations u0))
+    )
+    (asserts! (>= member-stake (var-get min-proposal-deposit)) ERR_NOT_AUTHORIZED)
+    (asserts! (> funding-goal u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (> milestone-count u0) (<= milestone-count u10)) ERR_INVALID_MILESTONE)
+    (asserts! (is-eq total-allocation funding-goal) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (len milestone-allocations) milestone-count) ERR_INVALID_MILESTONE)
+    (asserts! (is-eq (len milestone-deadlines) milestone-count) ERR_INVALID_MILESTONE)
+    (map-set projects project-id
+      {
+        title: title,
+        description: description,
+        funding-goal: funding-goal,
+        proposer: tx-sender,
+        votes-for: u0,
+        votes-against: u0,
+        voting-ends: (+ stacks-block-height (var-get voting-period)),
+        status: "voting",
+        funded-amount: u0,
+        milestone-count: milestone-count,
+        completed-milestones: u0,
+        milestone-based: true
+      }
+    )
+    (try! (create-project-milestones project-id milestone-descriptions milestone-allocations milestone-deadlines))
+    (var-set next-project-id (+ project-id u1))
+    (ok project-id)
   )
 )
 
@@ -241,7 +379,7 @@
     (asserts! (is-eq tx-sender (get proposer project)) ERR_NOT_AUTHORIZED)
     (asserts! (get milestone-based project) ERR_INVALID_MILESTONE)
     (asserts! (is-eq (get status milestone) "pending") ERR_MILESTONE_ALREADY_COMPLETED)
-    (asserts! (>= stacks-block-height (get completion-deadline milestone)) ERR_MILESTONE_NOT_READY)
+    (asserts! (<= stacks-block-height (get completion-deadline milestone)) ERR_MILESTONE_NOT_READY)
     (map-set project-milestones 
       { project-id: project-id, milestone-index: milestone-index }
       (merge milestone {
@@ -327,157 +465,10 @@
       { project-id: project-id, milestone-index: milestone-index }
       (merge milestone { status: "completed" })
     )
-    (if (is-eq (+ (get completed-milestones project) u1) (get milestone-count project))
-      (begin
-        (map-set projects project-id (merge project { status: "completed" }))
-        (ok true)
-      )
+    (if (is-eq (get completed-milestones project) (get milestone-count project))
+      (map-set projects project-id (merge project { status: "completed" }))
       (ok true)
     )
-  )
-)
-
-(define-public (resubmit-milestone (project-id uint) (milestone-index uint) (new-deliverable-hash (buff 32)))
-  (let
-    (
-      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
-      (milestone (unwrap! (map-get? project-milestones { project-id: project-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
-    )
-    (asserts! (is-eq tx-sender (get proposer project)) ERR_NOT_AUTHORIZED)
-    (asserts! (get milestone-based project) ERR_INVALID_MILESTONE)
-    (asserts! (is-eq (get status milestone) "rejected") ERR_MILESTONE_NOT_READY)
-    (map-set project-milestones 
-      { project-id: project-id, milestone-index: milestone-index }
-      (merge milestone {
-        deliverable-hash: (some new-deliverable-hash),
-        status: "submitted",
-        votes-for: u0,
-        votes-against: u0,
-        voting-ends: (some (+ stacks-block-height (var-get milestone-voting-period))),
-        submitted-at: (some stacks-block-height)
-      })
-    )
-    (ok true)
-  )
-)
-
-(define-public (extend-milestone-deadline (project-id uint) (milestone-index uint) (additional-blocks uint))
-  (let
-    (
-      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
-      (milestone (unwrap! (map-get? project-milestones { project-id: project-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
-    )
-    (asserts! (is-eq tx-sender (get proposer project)) ERR_NOT_AUTHORIZED)
-    (asserts! (get milestone-based project) ERR_INVALID_MILESTONE)
-    (asserts! (is-eq (get status milestone) "pending") ERR_MILESTONE_ALREADY_COMPLETED)
-    (asserts! (> additional-blocks u0) ERR_INVALID_AMOUNT)
-    (map-set project-milestones 
-      { project-id: project-id, milestone-index: milestone-index }
-      (merge milestone {
-        completion-deadline: (+ (get completion-deadline milestone) additional-blocks)
-      })
-    )
-    (ok true)
-  )
-)
-
-(define-public (withdraw-stake (amount uint))
-  (let
-    (
-      (current-stake (default-to u0 (map-get? member-stakes tx-sender)))
-    )
-    (asserts! (>= current-stake amount) ERR_INSUFFICIENT_FUNDS)
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
-    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
-    (map-set member-stakes tx-sender (- current-stake amount))
-    (var-set treasury-balance (- (var-get treasury-balance) amount))
-    (ok true)
-  )
-)
-
-(define-read-only (get-project (project-id uint))
-  (map-get? projects project-id)
-)
-
-(define-read-only (get-member-stake (member principal))
-  (default-to u0 (map-get? member-stakes member))
-)
-
-(define-read-only (get-member-vote (project-id uint) (voter principal))
-  (map-get? member-votes { project-id: project-id, voter: voter })
-)
-
-(define-read-only (get-project-funding (project-id uint) (funder principal))
-  (default-to u0 (map-get? project-funders { project-id: project-id, funder: funder }))
-)
-
-(define-read-only (get-treasury-balance)
-  (var-get treasury-balance)
-)
-
-(define-read-only (get-next-project-id)
-  (var-get next-project-id)
-)
-
-(define-read-only (get-voting-period)
-  (var-get voting-period)
-)
-
-(define-read-only (get-min-proposal-deposit)
-  (var-get min-proposal-deposit)
-)
-
-(define-read-only (get-project-milestone (project-id uint) (milestone-index uint))
-  (map-get? project-milestones { project-id: project-id, milestone-index: milestone-index })
-)
-
-(define-read-only (get-milestone-vote (project-id uint) (milestone-index uint) (voter principal))
-  (map-get? milestone-votes { project-id: project-id, milestone-index: milestone-index, voter: voter })
-)
-
-(define-read-only (get-milestone-voting-period)
-  (var-get milestone-voting-period)
-)
-
-(define-read-only (get-milestone-progress (project-id uint))
-  (let
-    (
-      (project (unwrap! (map-get? projects project-id) (err "Project not found")))
-    )
-    (if (get milestone-based project)
-      (ok {
-        total-milestones: (get milestone-count project),
-        completed-milestones: (get completed-milestones project),
-        completion-percentage: (if (> (get milestone-count project) u0)
-          (/ (* (get completed-milestones project) u100) (get milestone-count project))
-          u0
-        )
-      })
-      (err "Project is not milestone-based")
-    )
-  )
-)
-
-(define-public (update-voting-period (new-period uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (var-set voting-period new-period)
-    (ok true)
-  )
-)
-
-(define-public (update-min-deposit (new-deposit uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (var-set min-proposal-deposit new-deposit)
-    (ok true)
-  )
-)
-
-(define-public (update-milestone-voting-period (new-period uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (var-set milestone-voting-period new-period)
     (ok true)
   )
 )
