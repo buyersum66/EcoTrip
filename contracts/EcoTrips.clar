@@ -13,6 +13,12 @@
 (define-constant ERR_INVALID_MILESTONE (err u111))
 (define-constant ERR_MILESTONE_VOTING_ACTIVE (err u112))
 (define-constant ERR_ALL_MILESTONES_COMPLETED (err u113))
+(define-constant ERR_VERIFIER_NOT_FOUND (err u114))
+(define-constant ERR_ALREADY_VERIFIED (err u115))
+(define-constant ERR_CLAIM_NOT_FOUND (err u116))
+(define-constant ERR_INVALID_VERIFICATION (err u117))
+(define-constant ERR_VERIFIER_NOT_CERTIFIED (err u118))
+(define-constant ERR_INVALID_IMPACT_SCORE (err u119))
 
 (define-data-var next-project-id uint u1)
 (define-data-var treasury-balance uint u0)
@@ -20,6 +26,9 @@
 (define-data-var voting-period uint u1440)
 (define-data-var next-milestone-id uint u1)
 (define-data-var milestone-voting-period uint u144)
+(define-data-var next-verifier-id uint u1)
+(define-data-var next-claim-id uint u1)
+(define-data-var min-verifier-stake uint u5000000)
 
 (define-map projects
   uint
@@ -35,7 +44,10 @@
     funded-amount: uint,
     milestone-count: uint,
     completed-milestones: uint,
-    milestone-based: bool
+    milestone-based: bool,
+    impact-score: uint,
+    verified-claims: uint,
+    reputation-score: uint
   }
 )
 
@@ -72,6 +84,42 @@
 (define-map milestone-votes
   { project-id: uint, milestone-index: uint, voter: principal }
   { vote: bool, amount: uint }
+)
+
+;; Environmental impact verification maps
+(define-map environmental-verifiers
+  principal
+  {
+    verifier-id: uint,
+    name: (string-ascii 100),
+    certification: (string-ascii 200),
+    stake-amount: uint,
+    verified-claims: uint,
+    accuracy-score: uint,
+    status: (string-ascii 20),
+    certified-at: uint
+  }
+)
+
+(define-map impact-claims
+  uint
+  {
+    project-id: uint,
+    claimant: principal,
+    claim-type: (string-ascii 50),
+    claimed-impact: uint,
+    evidence-hash: (buff 32),
+    submitted-at: uint,
+    status: (string-ascii 20),
+    verified-impact: (optional uint),
+    verifier: (optional principal),
+    verified-at: (optional uint)
+  }
+)
+
+(define-map verification-votes
+  { claim-id: uint, verifier: principal }
+  { verified-impact: uint, confidence-score: uint }
 )
 
 (define-private (create-single-milestone (project-id uint) (milestone-index uint) (description (string-ascii 300)) (allocation uint) (deadline uint))
@@ -126,7 +174,10 @@
         funded-amount: u0,
         milestone-count: u0,
         completed-milestones: u0,
-        milestone-based: false
+        milestone-based: false,
+        impact-score: u0,
+        verified-claims: u0,
+        reputation-score: u100
       }
     )
     (var-set next-project-id (+ project-id u1))
@@ -145,7 +196,13 @@
     (asserts! (> deadline u0) ERR_INVALID_AMOUNT)
     (create-single-milestone project-id milestone-index description allocation deadline)
     (map-set projects project-id
-      (merge project { milestone-count: (+ (get milestone-count project) u1), milestone-based: true })
+      (merge project { 
+        milestone-count: (+ (get milestone-count project) u1), 
+        milestone-based: true,
+        impact-score: u0,
+        verified-claims: u0,
+        reputation-score: u100
+      })
     )
     (ok true)
   )
@@ -481,3 +538,218 @@
     (ok true)
   )
 )
+
+;; Environmental Impact Verification System Functions
+
+;; Register as environmental verifier
+(define-public (register-verifier (name (string-ascii 100)) (certification (string-ascii 200)))
+  (let
+    (
+      (verifier-id (var-get next-verifier-id))
+      (stake-amount (var-get min-verifier-stake))
+    )
+    (asserts! (> (len name) u0) ERR_INVALID_AMOUNT)
+    (asserts! (> (len certification) u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    (map-set environmental-verifiers tx-sender
+      {
+        verifier-id: verifier-id,
+        name: name,
+        certification: certification,
+        stake-amount: stake-amount,
+        verified-claims: u0,
+        accuracy-score: u100,
+        status: "pending",
+        certified-at: stacks-block-height
+      }
+    )
+    (var-set next-verifier-id (+ verifier-id u1))
+    (ok verifier-id)
+  )
+)
+
+;; Certify verifier (DAO owner function)
+(define-public (certify-verifier (verifier principal))
+  (let
+    (
+      (verifier-data (unwrap! (map-get? environmental-verifiers verifier) ERR_VERIFIER_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status verifier-data) "pending") ERR_INVALID_VERIFICATION)
+    (map-set environmental-verifiers verifier
+      (merge verifier-data { status: "certified" })
+    )
+    (ok true)
+  )
+)
+
+;; Submit environmental impact claim
+(define-public (submit-impact-claim (project-id uint) (claim-type (string-ascii 50)) (claimed-impact uint) (evidence-hash (buff 32)))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (claim-id (var-get next-claim-id))
+    )
+    (asserts! (is-eq tx-sender (get proposer project)) ERR_NOT_AUTHORIZED)
+    (asserts! (or (is-eq (get status project) "funded") (is-eq (get status project) "completed")) ERR_PROJECT_NOT_APPROVED)
+    (asserts! (> claimed-impact u0) ERR_INVALID_AMOUNT)
+    (asserts! (> (len claim-type) u0) ERR_INVALID_AMOUNT)
+    (map-set impact-claims claim-id
+      {
+        project-id: project-id,
+        claimant: tx-sender,
+        claim-type: claim-type,
+        claimed-impact: claimed-impact,
+        evidence-hash: evidence-hash,
+        submitted-at: stacks-block-height,
+        status: "pending",
+        verified-impact: none,
+        verifier: none,
+        verified-at: none
+      }
+    )
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+;; Verify impact claim
+(define-public (verify-impact-claim (claim-id uint) (verified-impact uint) (confidence-score uint))
+  (let
+    (
+      (claim (unwrap! (map-get? impact-claims claim-id) ERR_CLAIM_NOT_FOUND))
+      (verifier-data (unwrap! (map-get? environmental-verifiers tx-sender) ERR_VERIFIER_NOT_FOUND))
+      (existing-vote (map-get? verification-votes { claim-id: claim-id, verifier: tx-sender }))
+    )
+    (asserts! (is-eq (get status verifier-data) "certified") ERR_VERIFIER_NOT_CERTIFIED)
+    (asserts! (is-eq (get status claim) "pending") ERR_ALREADY_VERIFIED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    (asserts! (and (>= confidence-score u1) (<= confidence-score u100)) ERR_INVALID_IMPACT_SCORE)
+    (map-set verification-votes 
+      { claim-id: claim-id, verifier: tx-sender }
+      { verified-impact: verified-impact, confidence-score: confidence-score }
+    )
+    (ok true)
+  )
+)
+
+;; Finalize impact verification
+(define-public (finalize-impact-verification (claim-id uint))
+  (let
+    (
+      (claim (unwrap! (map-get? impact-claims claim-id) ERR_CLAIM_NOT_FOUND))
+      (project (unwrap! (map-get? projects (get project-id claim)) ERR_PROJECT_NOT_FOUND))
+    )
+    (asserts! (is-eq (get status claim) "pending") ERR_ALREADY_VERIFIED)
+    ;; Simple verification: use the first verification for now
+    (let
+      (
+        (final-impact (get claimed-impact claim))
+        (new-impact-score (+ (get impact-score project) final-impact))
+        (new-verified-claims (+ (get verified-claims project) u1))
+        (new-reputation (calculate-reputation-score (get verified-claims project) new-impact-score))
+      )
+      (map-set impact-claims claim-id
+        (merge claim {
+          status: "verified",
+          verified-impact: (some final-impact),
+          verifier: (some tx-sender),
+          verified-at: (some stacks-block-height)
+        })
+      )
+      (map-set projects (get project-id claim)
+        (merge project {
+          impact-score: new-impact-score,
+          verified-claims: new-verified-claims,
+          reputation-score: new-reputation
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Calculate reputation score based on verified claims and impact
+(define-private (calculate-reputation-score (verified-claims uint) (impact-score uint))
+  (let
+    (
+      (base-score u100)
+      (claim-bonus (* verified-claims u10))
+      (impact-bonus (/ impact-score u1000))
+    )
+    (+ base-score (+ claim-bonus impact-bonus))
+  )
+)
+
+;; Get top projects by impact score
+(define-read-only (get-project-impact-ranking (project-id uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) (err "Project not found")))
+    )
+    (ok {
+      project-id: project-id,
+      impact-score: (get impact-score project),
+      verified-claims: (get verified-claims project),
+      reputation-score: (get reputation-score project),
+      title: (get title project)
+    })
+  )
+)
+
+;; Challenge impact claim (DAO member function)
+(define-public (challenge-impact-claim (claim-id uint) (reason (string-ascii 200)))
+  (let
+    (
+      (claim (unwrap! (map-get? impact-claims claim-id) ERR_CLAIM_NOT_FOUND))
+      (member-stake (default-to u0 (map-get? member-stakes tx-sender)))
+    )
+    (asserts! (> member-stake u0) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status claim) "verified") ERR_INVALID_VERIFICATION)
+    (asserts! (> (len reason) u0) ERR_INVALID_AMOUNT)
+    (map-set impact-claims claim-id
+      (merge claim { status: "challenged" })
+    )
+    (ok true)
+  )
+)
+
+;; Reward high-impact projects
+(define-public (distribute-impact-rewards (project-id uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (reward-amount (* (get impact-score project) u100))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> (get impact-score project) u0) ERR_INVALID_IMPACT_SCORE)
+    (asserts! (>= (var-get treasury-balance) reward-amount) ERR_INSUFFICIENT_FUNDS)
+    (try! (as-contract (stx-transfer? reward-amount tx-sender (get proposer project))))
+    (var-set treasury-balance (- (var-get treasury-balance) reward-amount))
+    (ok reward-amount)
+  )
+)
+
+;; Read-only functions for impact verification system
+(define-read-only (get-verifier-info (verifier principal))
+  (map-get? environmental-verifiers verifier)
+)
+
+(define-read-only (get-impact-claim (claim-id uint))
+  (map-get? impact-claims claim-id)
+)
+
+(define-read-only (get-verification-vote (claim-id uint) (verifier principal))
+  (map-get? verification-votes { claim-id: claim-id, verifier: verifier })
+)
+
+(define-read-only (get-next-claim-id)
+  (var-get next-claim-id)
+)
+
+(define-read-only (get-next-verifier-id)
+  (var-get next-verifier-id)
+)
+
+
+
